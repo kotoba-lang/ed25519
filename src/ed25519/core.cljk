@@ -30,14 +30,17 @@
 ;;   (ed/did-key-from-seed seed-bytes)  ; "did:key:z6Mk…"
 ;;   (ed/verify-derivation seed-bytes)  ; true   (signer self-check, no vector needed)
 (ns ed25519.core
-  {:kotoba/export [b58 b58-decode did-key->pubkey did-key-from-pub did-key-from-seed did-key-from-seed-hex hexify private-from-seed pubkey-from-seed public-from-raw seed-hex->pubkey-hex sign unhex verify verify-derivation verify-did]}
-  (:require [kotoba.bytes :as kbytes] [kotoba.lang.text :as str]
+  {:kotoba/export #?(:kotoba [b58 b58-decode did-key->pubkey did-key-from-pub did-key-from-seed did-key-from-seed-hex hexify pubkey-from-seed seed-hex->pubkey-hex sign unhex verify verify-did]
+                     :default [b58 b58-decode did-key->pubkey did-key-from-pub did-key-from-seed did-key-from-seed-hex hexify private-from-seed pubkey-from-seed public-from-raw seed-hex->pubkey-hex sign unhex verify verify-derivation verify-did])}
+  (:require #?@(:kotoba [[ed25519.edwards :as ed-e] [ed25519.sign :as ed-s] [sha2.sha512 :as sha512]]
+                :default [[kotoba.bytes :as kbytes] [kotoba.lang.text :as str]])
             #?(:cljs ["crypto" :as ncrypto]))
   #?(:clj (:import (java.security MessageDigest KeyFactory PrivateKey PublicKey Signature)
                    (java.security.spec PKCS8EncodedKeySpec X509EncodedKeySpec))))
 
 ;; ── platform byte helpers ─────────────────────────────────────────────────────
-(defn- blen [b] #?(:clj (count b) :cljs (.-length b)))
+#?(:clj (defn- blen [b] (count b))
+   :cljs (defn- blen [b] (.-length b)))
 #?(:cljs (defn- byte-ints
            "Bytes → vector of ints 0..255. The input may be a Uint8Array /
            Buffer (this library's own output) or a SIGNED byte container: on
@@ -135,225 +138,553 @@
 #?(:cljs (def ^:private pkcs8-prefix-hex "302e020100300506032b657004220420"))
 #?(:cljs (def ^:private spki-prefix-hex "302a300506032b6570032100"))
 
-(defn private-from-seed
-  "A platform private-key handle from a raw 32-byte seed (PKCS8 wrap):
+#?(:clj
+   (defn private-from-seed
+     "A platform private-key handle from a raw 32-byte seed (PKCS8 wrap):
    JCA PrivateKey on :clj, node:crypto KeyObject on :cljs."
-  [seed]
-  #?(:clj (.generatePrivate (KeyFactory/getInstance "Ed25519")
-                            (PKCS8EncodedKeySpec. (byte-array (concat (seq pkcs8-ed25519-prefix) (seq seed)))))
-     :cljs (.createPrivateKey ncrypto
-                              #js {:key (js/Buffer.concat
-                                         #js [(js/Buffer.from pkcs8-prefix-hex "hex")
-                                              (js/Buffer.from seed)])
-                                   :format "der" :type "pkcs8"})))
+     [seed]
+     (.generatePrivate (KeyFactory/getInstance "Ed25519")
+                       (PKCS8EncodedKeySpec. (byte-array (concat (seq pkcs8-ed25519-prefix) (seq seed))))))
+   :cljs
+   (defn private-from-seed
+     "A platform private-key handle from a raw 32-byte seed (PKCS8 wrap):
+   JCA PrivateKey on :clj, node:crypto KeyObject on :cljs."
+     [seed]
+     (.createPrivateKey ncrypto
+                        #js {:key (js/Buffer.concat
+                                   #js [(js/Buffer.from pkcs8-prefix-hex "hex")
+                                        (js/Buffer.from seed)])
+                             :format "der" :type "pkcs8"})))
 
-(defn public-from-raw
-  "A platform public-key handle from a raw 32-byte pubkey (X.509 SPKI wrap)."
-  [pub]
-  #?(:clj (.generatePublic (KeyFactory/getInstance "Ed25519")
-                           (X509EncodedKeySpec. (byte-array (concat (seq spki-ed25519-prefix) (seq pub)))))
-     :cljs (.createPublicKey ncrypto
-                             #js {:key (js/Buffer.concat
-                                        #js [(js/Buffer.from spki-prefix-hex "hex")
-                                             (js/Buffer.from pub)])
-                                  :format "der" :type "spki"})))
+#?(:clj
+   (defn public-from-raw
+     "A platform public-key handle from a raw 32-byte pubkey (X.509 SPKI wrap)."
+     [pub]
+     (.generatePublic (KeyFactory/getInstance "Ed25519")
+                      (X509EncodedKeySpec. (byte-array (concat (seq spki-ed25519-prefix) (seq pub))))))
+   :cljs
+   (defn public-from-raw
+     "A platform public-key handle from a raw 32-byte pubkey (X.509 SPKI wrap)."
+     [pub]
+     (.createPublicKey ncrypto
+                       #js {:key (js/Buffer.concat
+                                  #js [(js/Buffer.from spki-prefix-hex "hex")
+                                       (js/Buffer.from pub)])
+                            :format "der" :type "spki"})))
 
-(defn pubkey-from-seed
-  "Raw 32-byte Ed25519 seed → 32-byte PUBLIC key (RFC 8032 edwards25519).
+;; ── the Kotoba reading ───────────────────────────────────────────────────────
+;;
+;; Dual-runtime (the posix-path idiom, amu src/kotoba/compiler/posix_path.cljk):
+;; `#?(:kotoba A :default B)` gives Kotoba its own reading of a function. This
+;; namespace reaches the PLATFORM's signer and its BigInteger/node:crypto types on
+;; the host; none of that exists on Kotoba, where the same functions run on the
+;; portable RFC 8032 implementation (`ed25519.sign`) over `:vector-i64` bytes.
+;; So `private-from-seed`, `public-from-raw` and `verify-derivation`, whose whole
+;; subject is a platform key handle, have no Kotoba reading. And where the host
+;; THROWS on malformed input (a seed that is not 32 bytes, odd-length or non-hex
+;; text, a bad base58 character, a did:key that is not Ed25519), a Kotoba export
+;; may not abort, so the Kotoba reading answers an `[:option T]`: none for what
+;; the host rejects.
+
+#?(:kotoba
+   (defn- slice-of [v :vector-i64 from :i64 to :i64] :vector-i64
+     (loop [i from out (vector-i64)]
+       (if (>= i to) out (recur (+ i 1) (vector-conj out (vector-at v i)))))))
+
+#?(:kotoba
+   (defn- append-all [a :vector-i64 b :vector-i64] :vector-i64
+     (let [n (vector-count b)]
+       (loop [i 0 out a]
+         (if (>= i n) out (recur (+ i 1) (vector-conj out (vector-at b i))))))))
+
+#?(:kotoba
+   (defn- utf8-width [cp :i64] :i64
+     (cond (< cp 128) 1 (< cp 2048) 2 (< cp 65536) 3 :else 4)))
+
+#?(:kotoba
+   ;; A seed that is not 32 bytes has no public key: none, where the host throws.
+   (defn pubkey-from-seed [seed :vector-i64] [:option :vector-i64]
+     (if (= 32 (vector-count seed))
+       (let [h (sha512/sha512 seed)
+             a (ed-s/clamp (slice-of h 0 32))]
+         (option-some-of [:option :vector-i64] (ed-e/encode (ed-e/scalar-mult-base a))))
+       (option-none-of [:option :vector-i64])))
+   :clj
+   (defn pubkey-from-seed
+     "Raw 32-byte Ed25519 seed → 32-byte PUBLIC key (RFC 8032 edwards25519).
    :clj derives it with pure BigInteger math (babashka-safe); :cljs asks
    node:crypto (createPublicKey over the PKCS8-wrapped seed, then drops
    the 12-byte SPKI DER prefix)."
-  [seed]
-  (when (not= 32 (blen seed))
-    (throw (ex-info "ed25519 seed must be exactly 32 bytes" {:got (blen seed)})))
-  #?(:clj
+     [seed]
+     (when (not= 32 (blen seed))
+       (throw (ex-info "ed25519 seed must be exactly 32 bytes" {:got (blen seed)})))
      (let [h (.digest (MessageDigest/getInstance "SHA-512") seed)
            a (le->bigint (clamp h))]
-       (compress (point-mul a B)))
-     :cljs
+       (compress (point-mul a B))))
+   :cljs
+   (defn pubkey-from-seed
+     "Raw 32-byte Ed25519 seed → 32-byte PUBLIC key (RFC 8032 edwards25519).
+   :clj derives it with pure BigInteger math (babashka-safe); :cljs asks
+   node:crypto (createPublicKey over the PKCS8-wrapped seed, then drops
+   the 12-byte SPKI DER prefix)."
+     [seed]
+     (when (not= 32 (blen seed))
+       (throw (ex-info "ed25519 seed must be exactly 32 bytes" {:got (blen seed)})))
      (let [spki (.export (.createPublicKey ncrypto (private-from-seed seed))
                          #js {:format "der" :type "spki"})]
        (js/Uint8Array. (.subarray spki 12)))))
 
 ;; ── hex + did:key conveniences ────────────────────────────────────────────────
-(defn hexify ^String [b]
-  #?(:clj (apply str (map #(format "%02x" (bit-and (int %) 0xff)) b))
-     :cljs (apply str (map #(-> (.toString % 16) (.padStart 2 "0")) (byte-ints b)))))
+#?(:kotoba
+   (defn hexify [b :vector-i64] :string
+     (let [n (vector-count b)]
+       (loop [i 0 out ""]
+         (if (>= i n)
+           out
+           (let [x (bit-and (vector-at b i) 0xff)]
+             (recur (+ i 1)
+                    (string-concat
+                     (string-concat out (string-substring "0123456789abcdef" (u64-shift-right x 4) (+ 1 (u64-shift-right x 4))))
+                     (string-substring "0123456789abcdef" (bit-and x 15) (+ 1 (bit-and x 15))))))))))
+   :default
+   (defn hexify ^String [b]
+     #?(:clj (apply str (map #(format "%02x" (bit-and (int %) 0xff)) b))
+        :cljs (apply str (map #(-> (.toString % 16) (.padStart 2 "0")) (byte-ints b))))))
 
-(defn unhex [^String s]
-  (let [s (str/replace s #"\s" "")]
-    (when (odd? (count s))
-      ;; `(partition 2 s)` on an odd-length string silently drops the
-      ;; trailing incomplete nibble instead of erroring -- a truncated/
-      ;; malformed hex string (an odd number of hex digits is never valid
-      ;; encoded byte data) must fail loudly, not quietly decode a
-      ;; shorter-than-intended byte array. Concretely dangerous here: a
-      ;; 65-char (one-too-many) seed-hex silently truncates to exactly 32
-      ;; bytes -- pubkey-from-seed's OWN `(not= 32 (count seed))` guard
-      ;; then can't catch it, since the truncated result happens to be
-      ;; the "right" length, just the WRONG bytes -- silently deriving a
-      ;; pubkey/did:key from truncated seed material with no error
-      ;; anywhere. Matches the identical fix already landed in this
-      ;; ecosystem's multiformats.core/unhex (same bug class, same fn
-      ;; name, independently hand-rolled here).
-      (throw (ex-info "unhex: odd-length hex string" {:s s})))
-    #?(:clj (byte-array (map (fn [[a b]] (unchecked-byte (Integer/parseInt (str a b) 16)))
-                             (partition 2 s)))
-       :cljs (js/Uint8Array. (into-array (map (fn [[a b]] (js/parseInt (str a b) 16))
-                                              (partition 2 s)))))))
+#?(:kotoba
+   (defn- hex-digit-value [c :i64] :i64
+     (cond (if (>= c 48) (<= c 57) false) (- c 48)
+           (if (>= c 97) (<= c 102) false) (- c 87)
+           (if (>= c 65) (<= c 70) false) (- c 55)
+           :else -1)))
 
-(defn seed-hex->pubkey-hex
-  "Hex seed → hex public key."
-  ^String [^String seed-hex]
-  (hexify (pubkey-from-seed (unhex seed-hex))))
+#?(:kotoba
+   ;; the ASCII whitespace java.lang's \s matches
+   (defn- ws-code? [c :i64] :bool
+     (if (= c 32) true
+         (if (>= c 9) (<= c 13) false))))
+
+#?(:kotoba
+   ;; the hex digit values of `s` with whitespace dropped, or the single value -1
+   ;; when some other character is present
+   (defn- hex-digits [s :string] :vector-i64
+     (let [n (string-byte-length s)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           out
+           (let [c (string-code-point-at s i)
+                 w (utf8-width c)]
+             (if (ws-code? c)
+               (recur (+ i w) out)
+               (let [d (hex-digit-value c)]
+                 (if (< d 0)
+                   (vector-i64 -1)
+                   (recur (+ i w) (vector-conj out d)))))))))))
+
+#?(:kotoba
+   (defn- pair-up [digits :vector-i64] :vector-i64
+     (let [n (quot (vector-count digits) 2)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           out
+           (recur (+ i 1)
+                  (vector-conj out (+ (* 16 (vector-at digits (* 2 i)))
+                                      (vector-at digits (+ 1 (* 2 i)))))))))))
+
+#?(:kotoba
+   (defn unhex [s :string] [:option :vector-i64]
+     (let [digits (hex-digits s)]
+       (if (= 0 (vector-count digits))
+         (option-some-of [:option :vector-i64] (vector-i64))
+         (if (= -1 (vector-at digits 0))
+           (option-none-of [:option :vector-i64])
+           (if (= 1 (- (vector-count digits) (* 2 (quot (vector-count digits) 2))))
+             (option-none-of [:option :vector-i64])
+             (option-some-of [:option :vector-i64] (pair-up digits)))))))
+   :default
+   (defn unhex [^String s]
+     (let [s (str/replace s #"\s" "")]
+       (when (odd? (count s))
+         ;; `(partition 2 s)` on an odd-length string silently drops the
+         ;; trailing incomplete nibble instead of erroring -- a truncated/
+         ;; malformed hex string (an odd number of hex digits is never valid
+         ;; encoded byte data) must fail loudly, not quietly decode a
+         ;; shorter-than-intended byte array. Concretely dangerous here: a
+         ;; 65-char (one-too-many) seed-hex silently truncates to exactly 32
+         ;; bytes -- pubkey-from-seed's OWN `(not= 32 (count seed))` guard
+         ;; then can't catch it, since the truncated result happens to be
+         ;; the "right" length, just the WRONG bytes -- silently deriving a
+         ;; pubkey/did:key from truncated seed material with no error
+         ;; anywhere. Matches the identical fix already landed in this
+         ;; ecosystem's multiformats.core/unhex (same bug class, same fn
+         ;; name, independently hand-rolled here).
+         (throw (ex-info "unhex: odd-length hex string" {:s s})))
+       #?(:clj (byte-array (map (fn [[a b]] (unchecked-byte (Integer/parseInt (str a b) 16)))
+                                (partition 2 s)))
+          :cljs (js/Uint8Array. (into-array (map (fn [[a b]] (js/parseInt (str a b) 16))
+                                                 (partition 2 s))))))))
+
+#?(:kotoba
+   (defn seed-hex->pubkey-hex [seed-hex :string] [:option :string]
+     (match-option (unhex seed-hex) [:option :vector-i64]
+       (none (option-none-of [:option :string]))
+       (some seed (match-option (pubkey-from-seed seed) [:option :vector-i64]
+                    (none (option-none-of [:option :string]))
+                    (some pub (option-some-of [:option :string] (hexify pub)))))))
+   :default
+   (defn seed-hex->pubkey-hex
+     "Hex seed → hex public key."
+     ^String [^String seed-hex]
+     (hexify (pubkey-from-seed (unhex seed-hex)))))
 
 (def ^:private b58-alphabet
   "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 
-(defn b58
-  "base58btc (Bitcoin alphabet) encode."
-  ^String [b]
-  #?(:clj
-     (let [n (BigInteger. 1 ^bytes b) fifty8 (biginteger 58)]
-       (loop [n n acc ""]
-         (if (pos? (.signum n))
-           (recur (.divide n fifty8)
-                  (str (.charAt ^String b58-alphabet (.intValue (.mod n fifty8))) acc))
-           (str (apply str (repeat (count (take-while zero? (seq b))) \1)) acc))))
-     :cljs
-     ;; classic byte-vector long division -- no BigInt (nbb's SCI has no js*,
-     ;; and cljs.core arithmetic isn't BigInt-safe), sizes here are tiny.
-     (let [ints (byte-ints b)
-           digits (reduce
-                   (fn [digits in-byte]
-                     (loop [j 0 carry in-byte digits digits]
-                       (if (< j (count digits))
-                         (let [v (+ (* (nth digits j) 256) carry)]
-                           (recur (inc j) (quot v 58) (assoc digits j (rem v 58))))
-                         (loop [carry carry digits digits]
-                           (if (pos? carry)
-                             (recur (quot carry 58) (conj digits (rem carry 58)))
-                             digits)))))
-                   [] ints)]
-       (str (apply str (repeat (count (take-while zero? ints)) "1"))
-            (apply str (map #(.charAt b58-alphabet %) (reverse digits)))))))
+#?(:kotoba
+   (defn- b58-push [d0 :vector-i64 carry0 :i64] :vector-i64
+     (loop [d d0 carry carry0]
+       (if (> carry 0)
+         (let [q (quot carry 58)]
+           (recur (vector-conj d (- carry (* q 58))) q))
+         d))))
 
-(defn did-key-from-pub
-  "Raw 32-byte Ed25519 pubkey → did:key (multicodec 0xed01 + base58btc, z-prefixed)."
-  ^String [pub]
-  (str "did:key:z"
-       (b58 #?(:clj (byte-array (concat [(unchecked-byte 0xed) (unchecked-byte 0x01)] (seq pub)))
-               :cljs (js/Uint8Array. (into-array (concat [0xed 0x01] (byte-ints pub))))))))
+#?(:kotoba
+   ;; digits * 256 + in-byte, in base 58, least significant digit first
+   (defn- b58-mul [d0 :vector-i64 in-byte :i64] :vector-i64
+     (let [n (vector-count d0)]
+       (loop [j 0 d d0 carry in-byte]
+         (if (< j n)
+           (let [v (+ (* (vector-at d j) 256) carry)
+                 q (quot v 58)]
+             (recur (+ j 1) (vector-assoc d j (- v (* q 58))) q))
+           (b58-push d carry))))))
 
-(defn did-key-from-seed
-  "Raw 32-byte seed → did:key:z6Mk…"
-  ^String [seed]
-  (did-key-from-pub (pubkey-from-seed seed)))
+#?(:kotoba
+   (defn- b58-digits [b :vector-i64] :vector-i64
+     (let [n (vector-count b)]
+       (loop [i 0 acc (vector-i64)]
+         (if (>= i n)
+           acc
+           (recur (+ i 1) (b58-mul acc (bit-and (vector-at b i) 0xff))))))))
 
-(defn did-key-from-seed-hex
-  "Hex seed → did:key:z6Mk…"
-  ^String [^String seed-hex]
-  (did-key-from-seed (unhex seed-hex)))
+#?(:kotoba
+   (defn- leading-zeros [b :vector-i64] :i64
+     (let [n (vector-count b)]
+       (loop [i 0]
+         (if (>= i n)
+           i
+           (if (= 0 (bit-and (vector-at b i) 0xff)) (recur (+ i 1)) i))))))
+
+#?(:kotoba
+   (defn- ones [n :i64] :string
+     (loop [i 0 out ""]
+       (if (>= i n) out (recur (+ i 1) (string-concat out "1"))))))
+
+#?(:kotoba
+   ;; digits from the most significant (the last) down, as alphabet characters
+   (defn- digits->text [d :vector-i64] :string
+     (loop [i (- (vector-count d) 1) out ""]
+       (if (< i 0)
+         out
+         (let [x (vector-at d i)]
+           (recur (- i 1) (string-concat out (string-substring b58-alphabet x (+ x 1)))))))))
+
+#?(:kotoba
+   (defn b58 [b :vector-i64] :string
+     (string-concat (ones (leading-zeros b)) (digits->text (b58-digits b))))
+   :default
+   (defn b58
+     "base58btc (Bitcoin alphabet) encode."
+     ^String [b]
+     #?(:clj
+        (let [n (BigInteger. 1 ^bytes b) fifty8 (biginteger 58)]
+          (loop [n n acc ""]
+            (if (pos? (.signum n))
+              (recur (.divide n fifty8)
+                     (str (.charAt ^String b58-alphabet (.intValue (.mod n fifty8))) acc))
+              (str (apply str (repeat (count (take-while zero? (seq b))) \1)) acc))))
+        :cljs
+        ;; classic byte-vector long division -- no BigInt (nbb's SCI has no js*,
+        ;; and cljs.core arithmetic isn't BigInt-safe), sizes here are tiny.
+        (let [ints (byte-ints b)
+              digits (reduce
+                      (fn [digits in-byte]
+                        (loop [j 0 carry in-byte digits digits]
+                          (if (< j (count digits))
+                            (let [v (+ (* (nth digits j) 256) carry)]
+                              (recur (inc j) (quot v 58) (assoc digits j (rem v 58))))
+                            (loop [carry carry digits digits]
+                              (if (pos? carry)
+                                (recur (quot carry 58) (conj digits (rem carry 58)))
+                                digits)))))
+                      [] ints)]
+          (str (apply str (repeat (count (take-while zero? ints)) "1"))
+               (apply str (map #(.charAt b58-alphabet %) (reverse digits))))))))
+
+#?(:kotoba
+   (defn did-key-from-pub [pub :vector-i64] :string
+     (string-concat "did:key:z" (b58 (append-all (vector-i64 0xed 0x01) pub))))
+   :default
+   (defn did-key-from-pub
+     "Raw 32-byte Ed25519 pubkey → did:key (multicodec 0xed01 + base58btc, z-prefixed)."
+     ^String [pub]
+     (str "did:key:z"
+          (b58 #?(:clj (byte-array (concat [(unchecked-byte 0xed) (unchecked-byte 0x01)] (seq pub)))
+                  :cljs (js/Uint8Array. (into-array (concat [0xed 0x01] (byte-ints pub)))))))))
+
+#?(:kotoba
+   (defn did-key-from-seed [seed :vector-i64] [:option :string]
+     (match-option (pubkey-from-seed seed) [:option :vector-i64]
+       (none (option-none-of [:option :string]))
+       (some pub (option-some-of [:option :string] (did-key-from-pub pub)))))
+   :default
+   (defn did-key-from-seed
+     "Raw 32-byte seed → did:key:z6Mk…"
+     ^String [seed]
+     (did-key-from-pub (pubkey-from-seed seed))))
+
+#?(:kotoba
+   (defn did-key-from-seed-hex [seed-hex :string] [:option :string]
+     (match-option (unhex seed-hex) [:option :vector-i64]
+       (none (option-none-of [:option :string]))
+       (some seed (did-key-from-seed seed))))
+   :default
+   (defn did-key-from-seed-hex
+     "Hex seed → did:key:z6Mk…"
+     ^String [^String seed-hex]
+     (did-key-from-seed (unhex seed-hex))))
+
 
 ;; ── runtime self-check via the platform signer (no hardcoded vector needed) ───
-(defn verify-derivation
-  "Independent correctness check: sign a fixed message with the platform's
-   PKCS8(seed) private key, then verify it under the pubkey THIS namespace
-   derived. Returns true iff they agree — proving the derived pubkey matches
-   the seed's true key without relying on any external test vector."
-  [seed]
-  #?(:clj
-     (let [msg (kbytes/utf8-bytes "ed25519.core self-check")
-           s   (doto (Signature/getInstance "Ed25519") (.initSign (private-from-seed seed)))
-           _   (.update s msg)
-           sig (.sign s)
-           v   (doto (Signature/getInstance "Ed25519")
-                 (.initVerify ^PublicKey (public-from-raw (pubkey-from-seed seed))))
-           _   (.update v msg)]
-       (.verify v sig))
-     :cljs
-     (let [msg (js/Buffer.from (.encode (js/TextEncoder.) "ed25519.core self-check"))
-           sig (.sign ncrypto nil msg (private-from-seed seed))]
-       (.verify ncrypto nil msg (public-from-raw (pubkey-from-seed seed)) sig))))
+#?(:clj
+   (defn verify-derivation
+     "Independent correctness check: sign a fixed message with the platform's
+      PKCS8(seed) private key, then verify it under the pubkey THIS namespace
+      derived. Returns true iff they agree — proving the derived pubkey matches
+      the seed's true key without relying on any external test vector."
+     [seed]
+     #?(:clj
+        (let [msg (kbytes/utf8-bytes "ed25519.core self-check")
+              s   (doto (Signature/getInstance "Ed25519") (.initSign (private-from-seed seed)))
+              _   (.update s msg)
+              sig (.sign s)
+              v   (doto (Signature/getInstance "Ed25519")
+                    (.initVerify ^PublicKey (public-from-raw (pubkey-from-seed seed))))
+              _   (.update v msg)]
+          (.verify v sig))
+        :cljs
+        (let [msg (js/Buffer.from (.encode (js/TextEncoder.) "ed25519.core self-check"))
+              sig (.sign ncrypto nil msg (private-from-seed seed))]
+          (.verify ncrypto nil msg (public-from-raw (pubkey-from-seed seed)) sig))))
+   :cljs
+   (defn verify-derivation
+     "Independent correctness check: sign a fixed message with the platform's
+      PKCS8(seed) private key, then verify it under the pubkey THIS namespace
+      derived. Returns true iff they agree — proving the derived pubkey matches
+      the seed's true key without relying on any external test vector."
+     [seed]
+     #?(:clj
+        (let [msg (kbytes/utf8-bytes "ed25519.core self-check")
+              s   (doto (Signature/getInstance "Ed25519") (.initSign (private-from-seed seed)))
+              _   (.update s msg)
+              sig (.sign s)
+              v   (doto (Signature/getInstance "Ed25519")
+                    (.initVerify ^PublicKey (public-from-raw (pubkey-from-seed seed))))
+              _   (.update v msg)]
+          (.verify v sig))
+        :cljs
+        (let [msg (js/Buffer.from (.encode (js/TextEncoder.) "ed25519.core self-check"))
+              sig (.sign ncrypto nil msg (private-from-seed seed))]
+          (.verify ncrypto nil msg (public-from-raw (pubkey-from-seed seed)) sig)))))
 
 ;; ── base58 decode (for did:key parsing) ───────────────────────────────────────
-(def ^:private b58-idx
-  (into {} (map-indexed (fn [i c] [c i]) b58-alphabet)))
+#?(:clj
+   (def ^:private b58-idx
+     (into {} (map-indexed (fn [i c] [c i]) b58-alphabet)))
+   :cljs
+   (def ^:private b58-idx
+     (into {} (map-indexed (fn [i c] [c i]) b58-alphabet))))
 
-(defn b58-decode
-  "base58btc (Bitcoin alphabet) decode → byte-array. Leading '1's → leading 0x00."
-  [^String s]
-  #?(:clj
-     (let [^BigInteger n (reduce (fn [^BigInteger acc c]
-                       (.add (.multiply acc (biginteger 58))
-                             (biginteger (int (or (b58-idx c)
-                                                  (throw (ex-info "bad base58 char" {:c c})))))))
-                     BigInteger/ZERO (seq s))
-           body (if (zero? (.signum n))
-                  (byte-array 0)
-                  (let [ba (.toByteArray n)]
-                    (if (and (> (count ba) 1) (zero? (aget ba 0))) (byte-array (rest (seq ba))) ba)))
-           leading (count (take-while #(= \1 %) s))]
-       (byte-array (concat (repeat leading (byte 0)) (seq body))))
-     :cljs
-     ;; same long-division shape as the :cljs b58 encoder, base 58 -> 256.
-     (let [bytes (reduce
-                  (fn [bytes c]
-                    (let [v (or (b58-idx c)
-                                (throw (ex-info "bad base58 char" {:c c})))]
-                      (loop [j 0 carry v bytes bytes]
-                        (if (< j (count bytes))
-                          (let [x (+ (* (nth bytes j) 58) carry)]
-                            (recur (inc j) (quot x 256) (assoc bytes j (rem x 256))))
-                          (loop [carry carry bytes bytes]
-                            (if (pos? carry)
-                              (recur (quot carry 256) (conj bytes (rem carry 256)))
-                              bytes))))))
-                  [] (seq s))
-           leading (count (take-while #(= \1 %) (seq s)))]
-       (js/Uint8Array. (into-array (concat (repeat leading 0) (reverse bytes)))))))
+#?(:kotoba
+   ;; index of ASCII code point `c` in the alphabet, or -1
+   (defn- b58-index [c :i64] :i64
+     (loop [i 0]
+       (if (>= i 58)
+         -1
+         (if (= c (string-code-point-at b58-alphabet i)) i (recur (+ i 1)))))))
+
+#?(:kotoba
+   ;; bytes * 58 + v, least significant byte first
+   (defn- b58-accumulate [b0 :vector-i64 v :i64] :vector-i64
+     (let [n (vector-count b0)]
+       (loop [j 0 b b0 carry v]
+         (if (< j n)
+           (let [x (+ (* (vector-at b j) 58) carry)
+                 q (quot x 256)]
+             (recur (+ j 1) (vector-assoc b j (- x (* q 256))) q))
+           (loop [c carry out b]
+             (if (> c 0)
+               (let [q (quot c 256)]
+                 (recur q (vector-conj out (- c (* q 256)))))
+               out)))))))
+
+#?(:kotoba
+   ;; the value of `s` as little-endian bytes, or the single value -1 when a
+   ;; character is not in the alphabet
+   (defn- b58-value [s :string] :vector-i64
+     (let [n (string-byte-length s)]
+       (loop [i 0 acc (vector-i64)]
+         (if (>= i n)
+           acc
+           (let [c (string-code-point-at s i)
+                 v (b58-index c)]
+             (if (< v 0)
+               (vector-i64 -1)
+               (recur (+ i (utf8-width c)) (b58-accumulate acc v)))))))))
+
+#?(:kotoba
+   (defn- leading-ones [s :string] :i64
+     (let [n (string-byte-length s)]
+       (loop [i 0]
+         (if (>= i n)
+           i
+           (if (= 49 (string-code-point-at s i)) (recur (+ i 1)) i))))))
+
+#?(:kotoba
+   (defn- reverse-onto [out0 :vector-i64 v :vector-i64] :vector-i64
+     (loop [i (- (vector-count v) 1) out out0]
+       (if (< i 0) out (recur (- i 1) (vector-conj out (vector-at v i)))))))
+
+#?(:kotoba
+   (defn- zeros [n :i64] :vector-i64
+     (loop [i 0 out (vector-i64)]
+       (if (>= i n) out (recur (+ i 1) (vector-conj out 0))))))
+
+#?(:kotoba
+   (defn b58-decode [s :string] [:option :vector-i64]
+     (let [v (b58-value s)]
+       (if (if (= 1 (vector-count v)) (= -1 (vector-at v 0)) false)
+         (option-none-of [:option :vector-i64])
+         (option-some-of [:option :vector-i64]
+                         (reverse-onto (zeros (leading-ones s)) v)))))
+   :default
+   (defn b58-decode
+     "base58btc (Bitcoin alphabet) decode → byte-array. Leading '1's → leading 0x00."
+     [^String s]
+     #?(:clj
+        (let [^BigInteger n (reduce (fn [^BigInteger acc c]
+                          (.add (.multiply acc (biginteger 58))
+                                (biginteger (int (or (b58-idx c)
+                                                     (throw (ex-info "bad base58 char" {:c c})))))))
+                        BigInteger/ZERO (seq s))
+              body (if (zero? (.signum n))
+                     (byte-array 0)
+                     (let [ba (.toByteArray n)]
+                       (if (and (> (count ba) 1) (zero? (aget ba 0))) (byte-array (rest (seq ba))) ba)))
+              leading (count (take-while #(= \1 %) s))]
+          (byte-array (concat (repeat leading (byte 0)) (seq body))))
+        :cljs
+        ;; same long-division shape as the :cljs b58 encoder, base 58 -> 256.
+        (let [bytes (reduce
+                     (fn [bytes c]
+                       (let [v (or (b58-idx c)
+                                   (throw (ex-info "bad base58 char" {:c c})))]
+                         (loop [j 0 carry v bytes bytes]
+                           (if (< j (count bytes))
+                             (let [x (+ (* (nth bytes j) 58) carry)]
+                               (recur (inc j) (quot x 256) (assoc bytes j (rem x 256))))
+                             (loop [carry carry bytes bytes]
+                               (if (pos? carry)
+                                 (recur (quot carry 256) (conj bytes (rem carry 256)))
+                                 bytes))))))
+                     [] (seq s))
+              leading (count (take-while #(= \1 %) (seq s)))]
+          (js/Uint8Array. (into-array (concat (repeat leading 0) (reverse bytes))))))))
+
 
 ;; ── did:key parsing ───────────────────────────────────────────────────────────
-(defn did-key->pubkey
-  "Parse a did:key:z6Mk… (Ed25519) → raw 32-byte public key. Verifies the
-   multicodec 0xed01 prefix; throws on a non-Ed25519 did:key."
-  [^String did]
-  (when-not (str/starts-with? did "did:key:z")
-    (throw (ex-info "expected a did:key:z… multibase did" {:did did})))
-  (let [bytes (b58-decode (subs did (count "did:key:z")))
-        nth-b (fn [i] #?(:clj (bit-and (aget ^bytes bytes (int i)) 0xff)
-                         :cljs (aget bytes i)))]
-    (when-not (and (= 34 (blen bytes))
-                   (= 0xed (nth-b 0))
-                   (= 0x01 (nth-b 1)))
-      (throw (ex-info "not an Ed25519 did:key (expected 0xed01 multicodec)" {:did did})))
-    #?(:clj (byte-array (drop 2 (seq bytes)))
-       :cljs (js/Uint8Array. (.subarray bytes 2)))))
+#?(:kotoba
+   ;; whether `p` occurs in `s` at byte offset `i` (ASCII `p`; every byte of `s`
+   ;; already compared equal to an ASCII byte, so `i` is a character boundary)
+   (defn- prefix-from? [s :string p :string i :i64] :bool
+     (if (>= i (string-byte-length p))
+       true
+       (if (< i (string-byte-length s))
+         (if (= (string-code-point-at s i) (string-code-point-at p i))
+           (prefix-from? s p (+ i 1))
+           false)
+         false))))
+
+#?(:kotoba
+   (defn did-key->pubkey [did :string] [:option :vector-i64]
+     (if (prefix-from? did "did:key:z" 0)
+       (match-option (b58-decode (string-substring did 9 (string-byte-length did))) [:option :vector-i64]
+         (none (option-none-of [:option :vector-i64]))
+         (some bs (if (= 34 (vector-count bs))
+                    (if (= 0xed (vector-at bs 0))
+                      (if (= 0x01 (vector-at bs 1))
+                        (option-some-of [:option :vector-i64] (slice-of bs 2 34))
+                        (option-none-of [:option :vector-i64]))
+                      (option-none-of [:option :vector-i64]))
+                    (option-none-of [:option :vector-i64]))))
+       (option-none-of [:option :vector-i64])))
+   :default
+   (defn did-key->pubkey
+     "Parse a did:key:z6Mk… (Ed25519) → raw 32-byte public key. Verifies the
+      multicodec 0xed01 prefix; throws on a non-Ed25519 did:key."
+     [^String did]
+     (when-not (str/starts-with? did "did:key:z")
+       (throw (ex-info "expected a did:key:z… multibase did" {:did did})))
+     (let [bytes (b58-decode (subs did (count "did:key:z")))
+           nth-b (fn [i] #?(:clj (bit-and (aget ^bytes bytes (int i)) 0xff)
+                            :cljs (aget bytes i)))]
+       (when-not (and (= 34 (blen bytes))
+                      (= 0xed (nth-b 0))
+                      (= 0x01 (nth-b 1)))
+         (throw (ex-info "not an Ed25519 did:key (expected 0xed01 multicodec)" {:did did})))
+       #?(:clj (byte-array (drop 2 (seq bytes)))
+          :cljs (js/Uint8Array. (.subarray bytes 2))))))
 
 ;; ── sign / verify (platform Ed25519; the seed/pubkey-bytes facing API) ────────
-(defn sign
-  "Sign `msg` (bytes) with the raw 32-byte seed → 64-byte Ed25519 signature."
-  [seed msg]
-  #?(:clj
-     (let [s (doto (Signature/getInstance "Ed25519")
-               (.initSign ^PrivateKey (private-from-seed seed)))]
-       (.update s ^bytes msg)
-       (.sign s))
-     :cljs
-     (js/Uint8Array. (.sign ncrypto nil (js/Buffer.from msg) (private-from-seed seed)))))
+#?(:kotoba
+   (defn sign [seed :vector-i64 msg :vector-i64] [:option :vector-i64]
+     (if (= 32 (vector-count seed))
+       (option-some-of [:option :vector-i64] (ed-s/sign (ed-s/secret-key seed) msg))
+       (option-none-of [:option :vector-i64])))
+   :default
+   (defn sign
+     "Sign `msg` (bytes) with the raw 32-byte seed → 64-byte Ed25519 signature."
+     [seed msg]
+     #?(:clj
+        (let [s (doto (Signature/getInstance "Ed25519")
+                  (.initSign ^PrivateKey (private-from-seed seed)))]
+          (.update s ^bytes msg)
+          (.sign s))
+        :cljs
+        (js/Uint8Array. (.sign ncrypto nil (js/Buffer.from msg) (private-from-seed seed))))))
 
-(defn verify
-  "Verify a 64-byte Ed25519 signature of `msg` under a raw 32-byte public key."
-  [pub msg sig]
-  #?(:clj
-     (let [v (doto (Signature/getInstance "Ed25519")
-               (.initVerify ^PublicKey (public-from-raw pub)))]
-       (.update v ^bytes msg)
-       (.verify v ^bytes sig))
-     :cljs
-     (.verify ncrypto nil (js/Buffer.from msg) (public-from-raw pub) (js/Buffer.from sig))))
+#?(:kotoba
+   (defn verify [pub :vector-i64 msg :vector-i64 sig :vector-i64] :bool
+     (ed-s/verify pub msg sig))
+   :default
+   (defn verify
+     "Verify a 64-byte Ed25519 signature of `msg` under a raw 32-byte public key."
+     [pub msg sig]
+     #?(:clj
+        (let [v (doto (Signature/getInstance "Ed25519")
+                  (.initVerify ^PublicKey (public-from-raw pub)))]
+          (.update v ^bytes msg)
+          (.verify v ^bytes sig))
+        :cljs
+        (.verify ncrypto nil (js/Buffer.from msg) (public-from-raw pub) (js/Buffer.from sig)))))
 
-(defn verify-did
-  "Verify a signature where the signer is identified by a did:key:z… (Ed25519)."
-  [^String did msg sig]
-  (verify (did-key->pubkey did) msg sig))
+#?(:kotoba
+   (defn verify-did [did :string msg :vector-i64 sig :vector-i64] [:option :bool]
+     (match-option (did-key->pubkey did) [:option :vector-i64]
+       (none (option-none-of [:option :bool]))
+       (some pub (option-some-of [:option :bool] (verify pub msg sig)))))
+   :default
+   (defn verify-did
+     "Verify a signature where the signer is identified by a did:key:z… (Ed25519)."
+     [^String did msg sig]
+     (verify (did-key->pubkey did) msg sig)))
