@@ -11,13 +11,32 @@
   {:kotoba/export [less-than-order? mul-add order-bytes reduce reduce32]}
   (:refer-clojure :exclude [reduce]))
 
-(def order-bytes
-  "L, little-endian. Derived from its definition rather than transcribed."
-  [
-   0xed 0xd3 0xf5 0x5c 0x1a 0x63 0x12 0x58
-   0xd6 0x9c 0xf7 0xa2 0xde 0xf9 0xde 0x14
-   0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
-   0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x10])
+#?(:kotoba
+   (defn order-bytes
+     "L, little-endian. Derived from its definition rather than transcribed."
+     [] :vector-i64
+     (vector-i64
+      0xed 0xd3 0xf5 0x5c 0x1a 0x63 0x12 0x58
+      0xd6 0x9c 0xf7 0xa2 0xde 0xf9 0xde 0x14
+      0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+      0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x10))
+   :default
+   (def order-bytes
+     "L, little-endian. Derived from its definition rather than transcribed."
+     [
+      0xed 0xd3 0xf5 0x5c 0x1a 0x63 0x12 0x58
+      0xd6 0x9c 0xf7 0xa2 0xde 0xf9 0xde 0x14
+      0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+      0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x10]))
+
+;; Dual-runtime (the posix-path idiom, amu src/kotoba/compiler/posix_path.cljk):
+;; `#?@(:kotoba [...])` adds the parameter and result types Kotoba needs and the
+;; host keeps the untyped Clojure it always ran; `#?(:kotoba A :default B)` gives
+;; Kotoba its own reading. Bytes are `:vector-i64` on Kotoba, and a `def` value
+;; that is exported (`order-bytes`) is a zero-argument function there.
+
+#?(:kotoba
+   (defn- order-byte [j :i64] :i64 (vector-at (order-bytes) j)))
 
 (defn- fdiv
   "Floor division, which `quot` is not for negative values.
@@ -27,9 +46,64 @@
   using it here leaves a carry one too small on every borrow -- producing a
   result that is congruent modulo L but not reduced, which is the kind of
   wrong that verifies against itself."
-  [v n]
-  (let [q (quot v n)]
-    (if (and (neg? v) (not (zero? (rem v n)))) (dec q) q)))
+  [#?@(:kotoba [v :i64 n :i64] :default [v n])] #?@(:kotoba [:i64])
+  #?(:kotoba
+     (let [q (quot v n)]
+       (if (if (< v 0) (not (= (- v (* q n)) 0)) false) (- q 1) q))
+     :default
+     (let [q (quot v n)]
+       (if (and (neg? v) (not (zero? (rem v n)))) (dec q) q))))
+
+#?(:kotoba
+   ;; One outer step: fold byte `i` (>= 32) of the 64-byte value downward by
+   ;; subtracting 16 * x[i] * L shifted into place, rounding each carry to
+   ;; nearest, then hand the last carry to limb i-12 and clear limb i.
+   (defn- fold-row [x0 :vector-i64 i :i64] :vector-i64
+     (let [xi (vector-at x0 i)]
+       (loop [j (- i 32) x x0 carry 0]
+         (if (>= j (- i 12))
+           (vector-assoc (vector-assoc x (- i 12) (+ (vector-at x (- i 12)) carry)) i 0)
+           (let [v (- (+ (vector-at x j) carry)
+                      (* (* 16 xi) (order-byte (- j (- i 32)))))
+                 cc (fdiv (+ v 128) 256)]
+             (recur (+ j 1) (vector-assoc x j (- v (* cc 256))) cc)))))))
+
+#?(:kotoba
+   (defn- fold-rows [x :vector-i64 i :i64] :vector-i64
+     (if (< i 32)
+       x
+       (fold-rows (fold-row x i) (- i 1)))))
+
+#?(:kotoba
+   ;; x[j] -= carry * L[j] over the low 32 limbs
+   (defn- subtract-carry [x0 :vector-i64 carry :i64] :vector-i64
+     (loop [j 0 x x0]
+       (if (= j 32)
+         x
+         (recur (+ j 1) (vector-assoc x j (- (vector-at x j) (* carry (order-byte j)))))))))
+
+#?(:kotoba
+   (defn- low-limbs [x :vector-i64] :vector-i64
+     (let [top (fdiv (vector-at x 31) 16)]
+       (loop [j 0 x x carry 0]
+         (if (= j 32)
+           (subtract-carry x carry)
+           (let [v (- (+ (vector-at x j) carry) (* top (order-byte j)))]
+             (recur (+ j 1) (vector-assoc x j (bit-and v 255)) (fdiv v 256))))))))
+
+#?(:kotoba
+   (defn- final-bytes [x0 :vector-i64] :vector-i64
+     (loop [i 0 x x0 out (vector-i64)]
+       (if (= i 32)
+         out
+         (let [x1 (vector-assoc x (+ i 1) (+ (vector-at x (+ i 1)) (fdiv (vector-at x i) 256)))]
+           (recur (+ i 1) x1 (vector-conj out (bit-and (vector-at x1 i) 255))))))))
+
+#?(:kotoba
+   ;; `reduce` is also the name of the fold sugar, which wins inside this module,
+   ;; so Kotoba callers here use this name and `reduce` below is the export.
+   (defn- reduce-64 [x64 :vector-i64] :vector-i64
+     (final-bytes (low-limbs (fold-rows x64 63)))))
 
 (defn reduce
   "Reduce a 64-byte little-endian value modulo L, to 32 bytes.
@@ -37,47 +111,75 @@
   The outer pass folds each byte above position 31 downward by subtracting a
   shifted multiple of L. The `+ 128` before dividing is rounding to nearest
   rather than toward zero, which keeps the running limbs centred and small."
-  [x64]
-  (let [x (loop [x (vec x64) i 63]
-            (if (< i 32)
-              x
-              (let [[x carry]
-                    (loop [x x j (- i 32) carry 0]
-                      (if (>= j (- i 12))
-                        [x carry]
-                        (let [v (- (+ (nth x j) carry)
-                                   (* 16 (nth x i) (nth order-bytes (- j (- i 32)))))
-                              cc (fdiv (+ v 128) 256)]
-                          (recur (assoc x j (- v (* cc 256))) (inc j) cc))))]
-                (recur (-> x (update (- i 12) + carry) (assoc i 0)) (dec i)))))
-        [x carry] (loop [x x j 0 carry 0]
-                    (if (= j 32)
-                      [x carry]
-                      (let [v (- (+ (nth x j) carry)
-                                 (* (fdiv (nth x 31) 16) (nth order-bytes j)))]
-                        (recur (assoc x j (bit-and v 255)) (inc j) (fdiv v 256)))))
-        x (clojure.core/reduce (fn [x j] (update x j - (* carry (nth order-bytes j))))
-                               x (range 32))]
-    (loop [x x i 0 out []]
-      (if (= i 32)
-        out
-        (let [x (update x (inc i) + (fdiv (nth x i) 256))]
-          (recur x (inc i) (conj out (bit-and (nth x i) 255))))))))
+  [#?@(:kotoba [x64 :vector-i64] :default [x64])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (reduce-64 x64)
+     :default
+     (let [x (loop [x (vec x64) i 63]
+               (if (< i 32)
+                 x
+                 (let [[x carry]
+                       (loop [x x j (- i 32) carry 0]
+                         (if (>= j (- i 12))
+                           [x carry]
+                           (let [v (- (+ (nth x j) carry)
+                                      (* 16 (nth x i) (nth order-bytes (- j (- i 32)))))
+                                 cc (fdiv (+ v 128) 256)]
+                             (recur (assoc x j (- v (* cc 256))) (inc j) cc))))]
+                   (recur (-> x (update (- i 12) + carry) (assoc i 0)) (dec i)))))
+           [x carry] (loop [x x j 0 carry 0]
+                       (if (= j 32)
+                         [x carry]
+                         (let [v (- (+ (nth x j) carry)
+                                    (* (fdiv (nth x 31) 16) (nth order-bytes j)))]
+                           (recur (assoc x j (bit-and v 255)) (inc j) (fdiv v 256)))))
+           x (clojure.core/reduce (fn [x j] (update x j - (* carry (nth order-bytes j))))
+                                  x (range 32))]
+       (loop [x x i 0 out []]
+         (if (= i 32)
+           out
+           (let [x (update x (inc i) + (fdiv (nth x i) 256))]
+             (recur x (inc i) (conj out (bit-and (nth x i) 255)))))))))
+
+#?(:kotoba
+   ;; x with a[i] * b[j] added into slot i+j, for every j
+   (defn- mul-row [a :vector-i64 b :vector-i64 i :i64 x0 :vector-i64] :vector-i64
+     (loop [j 0 x x0]
+       (if (= j 32)
+         x
+         (recur (+ j 1)
+                (vector-assoc x (+ i j) (+ (vector-at x (+ i j)) (* (vector-at a i) (vector-at b j)))))))))
+
+#?(:kotoba
+   (defn- zeros-onto [v :vector-i64 n :i64] :vector-i64
+     (loop [i 0 out v]
+       (if (>= i n) out (recur (+ i 1) (vector-conj out 0))))))
 
 (defn mul-add
   "`(a * b + c) mod L`, each argument 32 little-endian bytes.
 
   This is the whole of Ed25519's signing arithmetic: `S = (r + k*a) mod L`."
-  [a b c]
-  (reduce
-   (clojure.core/reduce (fn [x [i j]] (update x (+ i j) + (* (nth a i) (nth b j))))
-                        (vec (concat c (repeat 32 0)))
-                        (for [i (range 32) j (range 32)] [i j]))))
+  [#?@(:kotoba [a :vector-i64 b :vector-i64 c :vector-i64] :default [a b c])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (reduce-64
+      (loop [i 0 x (zeros-onto c 32)]
+        (if (= i 32)
+          x
+          (recur (+ i 1) (mul-row a b i x)))))
+     :default
+     (reduce
+      (clojure.core/reduce (fn [x [i j]] (update x (+ i j) + (* (nth a i) (nth b j))))
+                           (vec (concat c (repeat 32 0)))
+                           (for [i (range 32) j (range 32)] [i j])))))
 
 (defn reduce32
   "Reduce 32 bytes modulo L, by zero-extending to 64."
-  [b]
-  (reduce (vec (concat b (repeat 32 0)))))
+  [#?@(:kotoba [b :vector-i64] :default [b])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (reduce-64 (zeros-onto b 32))
+     :default
+     (reduce (vec (concat b (repeat 32 0))))))
 
 (defn less-than-order?
   "Whether a 32-byte scalar is strictly below L.
@@ -86,10 +188,18 @@
   signature can be mauled into a second valid one for the same message and
   key, which breaks anything that treats a signature as an identifier -- a
   deduplication key, a transaction id, a cache entry."
-  [s]
-  (loop [i 31]
-    (cond
-      (neg? i) false                     ; equal to L is not below L
-      (< (nth s i) (nth order-bytes i)) true
-      (> (nth s i) (nth order-bytes i)) false
-      :else (recur (dec i)))))
+  [#?@(:kotoba [s :vector-i64] :default [s])] #?@(:kotoba [:bool])
+  #?(:kotoba
+     (loop [i 31]
+       (cond
+         (< i 0) false                     ; equal to L is not below L
+         (< (vector-at s i) (order-byte i)) true
+         (> (vector-at s i) (order-byte i)) false
+         :else (recur (- i 1))))
+     :default
+     (loop [i 31]
+       (cond
+         (neg? i) false                     ; equal to L is not below L
+         (< (nth s i) (nth order-bytes i)) true
+         (> (nth s i) (nth order-bytes i)) false
+         :else (recur (dec i))))))
