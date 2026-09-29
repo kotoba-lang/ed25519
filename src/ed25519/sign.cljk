@@ -36,24 +36,73 @@
   **Not constant-time.** Timing is a property of machine code and no portable
   Clojure controls it. Where a timing side channel is in scope, use the
   platform's Ed25519 and treat this as the reference it is checked against."
-  {:kotoba/export [clamp hex public-bytes public-key secret-key secret-key! seed-bytes sign signature-bytes unhex verify]}
+  {:kotoba/export [clamp hex public-bytes secret-key seed-bytes sign signature-bytes verify]}
   (:require [ed25519.edwards :as e]
             [ed25519.scalar :as sc]
             [sha2.sha512 :as sha512]))
 
-(def seed-bytes 32)
-(def public-bytes 32)
-(def signature-bytes 64)
+(def ^:private seed-len 32)
+(def ^:private public-len 32)
+(def ^:private signature-len 64)
 
-(defn- ->ints [x] (mapv #(bit-and (int %) 0xFF) (seq x)))
+;; Dual-runtime (the posix-path idiom, amu src/kotoba/compiler/posix_path.cljk):
+;; `#?@(:kotoba [...])` adds the types Kotoba needs and the host keeps the untyped
+;; Clojure it always ran; `#?(:kotoba A :default B)` gives Kotoba its own reading.
+;;
+;; On Kotoba bytes are `:vector-i64`, the `secret-key` map is a `:document` with
+;; the same keys, and `e/decode`'s nil is an option. The three length constants
+;; are exported as zero-argument functions there (an export must name a function).
+;; `secret-key!`, `public-key` and `unhex` throw on bad input, and a Kotoba export
+;; may not abort, so they are host-only until the throw has a spelling.
+
+#?(:kotoba (defn seed-bytes [] :i64 seed-len) :default (def seed-bytes seed-len))
+#?(:kotoba (defn public-bytes [] :i64 public-len) :default (def public-bytes public-len))
+#?(:kotoba (defn signature-bytes [] :i64 signature-len) :default (def signature-bytes signature-len))
+
+(defn- ->ints [#?@(:kotoba [x :vector-i64] :default [x])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (let [n (vector-count x)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n) out (recur (+ i 1) (vector-conj out (bit-and (vector-at x i) 0xFF))))))
+     :default (mapv #(bit-and (int %) 0xFF) (seq x))))
+
+#?(:kotoba
+   (defn- slice [v :vector-i64 from :i64 to :i64] :vector-i64
+     (loop [i from out (vector-i64)]
+       (if (>= i to) out (recur (+ i 1) (vector-conj out (vector-at v i)))))))
+
+#?(:kotoba
+   (defn- append-all [a :vector-i64 b :vector-i64] :vector-i64
+     (let [n (vector-count b)]
+       (loop [i 0 out a]
+         (if (>= i n) out (recur (+ i 1) (vector-conj out (vector-at b i))))))))
+
+#?(:kotoba
+   (defn- bytes->document [bs :vector-i64] :document
+     (loop [i 0 d (document-vector)]
+       (if (>= i (vector-count bs))
+         d
+         (recur (+ i 1) (document-vector-conj d (document-i64 (vector-at bs i))))))))
+
+#?(:kotoba
+   (defn- document->bytes [d :document] :vector-i64
+     (let [n (document-count d)]
+       (loop [i 0 out (vector-i64)]
+         (if (>= i n)
+           out
+           (recur (+ i 1) (vector-conj out (option-or (document-i64-value (option-or (document-vector-at d i) (document-null))) 0))))))))
 
 (defn clamp
   "RFC 8032 §5.1.5. The low three bits are cleared so the scalar is a multiple
   of the cofactor, and bit 254 is set so the ladder's length is fixed."
-  [h]
-  (-> (vec h)
-      (assoc 0 (bit-and (nth h 0) 248))
-      (assoc 31 (bit-or (bit-and (nth h 31) 127) 64))))
+  [#?@(:kotoba [h :vector-i64] :default [h])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (vector-assoc (vector-assoc h 0 (bit-and (vector-at h 0) 248))
+                   31 (bit-or (bit-and (vector-at h 31) 127) 64))
+     :default
+     (-> (vec h)
+         (assoc 0 (bit-and (nth h 0) 248))
+         (assoc 31 (bit-or (bit-and (nth h 31) 127) 64)))))
 
 (defn secret-key
   "Expand a 32-byte seed into the signing state RFC 8032 §5.1.5 describes:
@@ -63,35 +112,91 @@
   different lifetimes and different disclosure rules — the public key is
   meant to be published and the other two are not, and a 64-byte blob invites
   handing all of it to something that needed one part."
-  [seed]
-  (let [seed (->ints seed)]
-    (if (not= seed-bytes (count seed))
-      {:status :error :reason :bad-seed-length :length (count seed)}
-      (let [h (sha512/sha512 seed)
-            a (clamp (subvec (vec h) 0 32))
-            prefix (subvec (vec h) 32 64)]
-        {:status :ok :seed seed :scalar a :prefix prefix
-         :public (e/encode (e/scalar-mult-base a))}))))
+  [#?@(:kotoba [seed :vector-i64] :default [seed])] #?@(:kotoba [:document])
+  #?(:kotoba
+     (let [sd (->ints seed)]
+       (if (= seed-len (vector-count sd))
+         (let [h (sha512/sha512 sd)
+               a (clamp (slice h 0 32))
+               prefix (slice h 32 64)]
+           (document-map :status (document-keyword :ok)
+                         :seed (bytes->document sd)
+                         :scalar (bytes->document a)
+                         :prefix (bytes->document prefix)
+                         :public (bytes->document (e/encode (e/scalar-mult-base a)))))
+         (document-map :status (document-keyword :error)
+                       :reason (document-keyword :bad-seed-length)
+                       :length (document-i64 (vector-count sd)))))
+     :default
+     (let [seed (->ints seed)]
+       (if (not= seed-len (count seed))
+         {:status :error :reason :bad-seed-length :length (count seed)}
+         (let [h (sha512/sha512 seed)
+               a (clamp (subvec (vec h) 0 32))
+               prefix (subvec (vec h) 32 64)]
+           {:status :ok :seed seed :scalar a :prefix prefix
+            :public (e/encode (e/scalar-mult-base a))})))))
 
-(defn secret-key!
-  [seed]
-  (let [r (secret-key seed)]
-    (if (= :ok (:status r)) r (throw (ex-info (str "ed25519: " (name (:reason r))) r)))))
+#?(:clj
+   (defn secret-key!
+     [seed]
+     (let [r (secret-key seed)]
+       (if (= :ok (:status r)) r (throw (ex-info (str "ed25519: " (name (:reason r))) r)))))
+   :cljs
+   (defn secret-key!
+     [seed]
+     (let [r (secret-key seed)]
+       (if (= :ok (:status r)) r (throw (ex-info (str "ed25519: " (name (:reason r))) r))))))
 
-(defn public-key
-  "The 32-byte public key for a seed."
-  [seed]
-  (:public (secret-key! seed)))
+#?(:clj
+   (defn public-key
+     "The 32-byte public key for a seed."
+     [seed]
+     (:public (secret-key! seed)))
+   :cljs
+   (defn public-key
+     "The 32-byte public key for a seed."
+     [seed]
+     (:public (secret-key! seed))))
 
 (defn sign
   "A 64-byte signature over `message`. `sk` is a `secret-key` map."
-  [sk message]
-  (let [m (->ints message)
-        r (sc/reduce (sha512/sha512 (concat (:prefix sk) m)))
-        big-r (e/encode (e/scalar-mult-base r))
-        k (sc/reduce (sha512/sha512 (concat big-r (:public sk) m)))
-        s (sc/mul-add k (:scalar sk) r)]
-    (vec (concat big-r s))))
+  [#?@(:kotoba [sk :document message :vector-i64] :default [sk message])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (let [m (->ints message)
+           prefix (document->bytes (option-or (document-get sk (document-keyword :prefix)) (document-null)))
+           scalar (document->bytes (option-or (document-get sk (document-keyword :scalar)) (document-null)))
+           public (document->bytes (option-or (document-get sk (document-keyword :public)) (document-null)))
+           r (sc/reduce (sha512/sha512 (append-all prefix m)))
+           big-r (e/encode (e/scalar-mult-base r))
+           k (sc/reduce (sha512/sha512 (append-all (append-all big-r public) m)))
+           s (sc/mul-add k scalar r)]
+       (append-all big-r s))
+     :default
+     (let [m (->ints message)
+           r (sc/reduce (sha512/sha512 (concat (:prefix sk) m)))
+           big-r (e/encode (e/scalar-mult-base r))
+           k (sc/reduce (sha512/sha512 (concat big-r (:public sk) m)))
+           s (sc/mul-add k (:scalar sk) r)]
+       (vec (concat big-r s)))))
+
+#?(:kotoba
+   ;; [S]B == R + [k]A, once both points decoded
+   (defn- check-equation [a :vector-i64 rp :vector-i64 big-r :vector-i64 public :vector-i64
+                          m :vector-i64 s :vector-i64] :bool
+     (let [k (sc/reduce (sha512/sha512 (append-all (append-all big-r public) m)))
+           lhs (e/scalar-mult-base s)
+           rhs (e/add rp (e/scalar-mult a k))]
+       (e/equal? lhs rhs))))
+
+#?(:kotoba
+   (defn- check-points [public :vector-i64 big-r :vector-i64 m :vector-i64 s :vector-i64] :bool
+     (match-option (e/decode public) [:option :vector-i64]
+       (none false)
+       (some a (match-option (e/decode big-r) [:option :vector-i64]
+                 (none false)
+                 (some rp (check-equation a rp big-r public m s)))))))
 
 (defn verify
   "Whether `signature` is valid for `message` under `public`.
@@ -100,31 +205,62 @@
   a malformed signature point, an out-of-range `S`, or a mismatch. A verifier
   that distinguishes those to its caller leaks which part of a forgery
   attempt was wrong."
-  [public message signature]
-  (let [public (->ints public)
-        sig (->ints signature)
-        m (->ints message)]
-    (boolean
-     (and (= public-bytes (count public))
-          (= signature-bytes (count sig))
-          (let [big-r (subvec sig 0 32)
-                s (subvec sig 32 64)]
-            (and (sc/less-than-order? s)
-                 (when-let [a (e/decode public)]
-                   (when-let [rp (e/decode big-r)]
-                     (let [k (sc/reduce (sha512/sha512 (concat big-r public m)))
-                           ;; [S]B  ==  R + [k]A
-                           lhs (e/scalar-mult-base s)
-                           rhs (e/add rp (e/scalar-mult a k))]
-                       (e/equal? lhs rhs))))))))))
+  [#?@(:kotoba [public :vector-i64 message :vector-i64 signature :vector-i64]
+       :default [public message signature])]
+  #?@(:kotoba [:bool])
+  #?(:kotoba
+     (let [pk (->ints public)
+           sg (->ints signature)
+           m (->ints message)]
+       (if (= public-len (vector-count pk))
+         (if (= signature-len (vector-count sg))
+           (let [big-r (slice sg 0 32)
+                 s (slice sg 32 64)]
+             (if (sc/less-than-order? s)
+               (check-points pk big-r m s)
+               false))
+           false)
+         false))
+     :default
+     (let [public (->ints public)
+           sig (->ints signature)
+           m (->ints message)]
+       (boolean
+        (and (= public-len (count public))
+             (= signature-len (count sig))
+             (let [big-r (subvec sig 0 32)
+                   s (subvec sig 32 64)]
+               (and (sc/less-than-order? s)
+                    (when-let [a (e/decode public)]
+                      (when-let [rp (e/decode big-r)]
+                        (let [k (sc/reduce (sha512/sha512 (concat big-r public m)))
+                              ;; [S]B  ==  R + [k]A
+                              lhs (e/scalar-mult-base s)
+                              rhs (e/add rp (e/scalar-mult a k))]
+                          (e/equal? lhs rhs)))))))))))
 
-(defn hex [bs]
-  (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
-                                s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
-                            (if (= 1 (count s)) (str "0" s) s)))
-                  bs)))
+(defn hex [#?@(:kotoba [bs :vector-i64] :default [bs])] #?@(:kotoba [:string])
+  #?(:kotoba
+     (let [n (vector-count bs)]
+       (loop [i 0 out ""]
+         (if (>= i n)
+           out
+           (let [b (bit-and (vector-at bs i) 0xFF)]
+             (recur (+ i 1)
+                    (string-concat
+                     (string-concat out (string-substring "0123456789abcdef" (u64-shift-right b 4) (+ 1 (u64-shift-right b 4))))
+                     (string-substring "0123456789abcdef" (bit-and b 15) (+ 1 (bit-and b 15)))))))))
+     :default
+     (apply str (map (fn [b] (let [b (bit-and (int b) 0xFF)
+                                   s #?(:clj (Integer/toString b 16) :cljs (.toString b 16))]
+                               (if (= 1 (count s)) (str "0" s) s)))
+                     bs))))
 
-(defn unhex [s]
-  (mapv (fn [p] #?(:clj (Integer/parseInt (apply str p) 16)
-                   :cljs (js/parseInt (apply str p) 16)))
-        (partition 2 s)))
+#?(:clj
+   (defn unhex [s]
+     (mapv (fn [p] (Integer/parseInt (apply str p) 16))
+           (partition 2 s)))
+   :cljs
+   (defn unhex [s]
+     (mapv (fn [p] (js/parseInt (apply str p) 16))
+           (partition 2 s))))

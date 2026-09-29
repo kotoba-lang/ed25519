@@ -24,71 +24,151 @@
   {:kotoba/export [add base decode encode equal? identity-point point scalar-mult scalar-mult-base]}
   (:require [x25519.field :as f]))
 
-(def ^:private d
-  "d = -121665/121666. Derived, not transcribed."
-  (f/of
-   [
-     0x78a3 0x1359 0x4dca 0x75eb 0xd8ab 0x4141 0x0a4d 0x0070
-     0xe898 0x7779 0x4079 0x8cc7 0xfe73 0x2b6f 0x6cee 0x5203]))
+#?(:kotoba
+   (defn- d [] :vector-i64
+     (f/of (vector-i64 0x78a3 0x1359 0x4dca 0x75eb 0xd8ab 0x4141 0x0a4d 0x0070 0xe898 0x7779 0x4079 0x8cc7 0xfe73 0x2b6f 0x6cee 0x5203)))
+   :default
+   (def ^:private d
+     "d = -121665/121666. Derived, not transcribed."
+     (f/of
+      [0x78a3 0x1359 0x4dca 0x75eb 0xd8ab 0x4141 0x0a4d 0x0070 0xe898 0x7779 0x4079 0x8cc7 0xfe73 0x2b6f 0x6cee 0x5203])))
 
-(def ^:private d2
-  "2d, which extended-coordinate addition uses directly."
-  (f/of
-   [
-     0xf159 0x26b2 0x9b94 0xebd6 0xb156 0x8283 0x149a 0x00e0
-     0xd130 0xeef3 0x80f2 0x198e 0xfce7 0x56df 0xd9dc 0x2406]))
+#?(:kotoba
+   (defn- d2 [] :vector-i64
+     (f/of (vector-i64 0xf159 0x26b2 0x9b94 0xebd6 0xb156 0x8283 0x149a 0x00e0 0xd130 0xeef3 0x80f2 0x198e 0xfce7 0x56df 0xd9dc 0x2406)))
+   :default
+   (def ^:private d2
+     "2d, which extended-coordinate addition uses directly."
+     (f/of
+      [0xf159 0x26b2 0x9b94 0xebd6 0xb156 0x8283 0x149a 0x00e0 0xd130 0xeef3 0x80f2 0x198e 0xfce7 0x56df 0xd9dc 0x2406])))
 
-(def ^:private sqrt-m1
-  "2^((p-1)/4): a square root of -1, needed when the eighth root in `decode` lands on the wrong branch."
-  (f/of
-   [
-     0xa0b0 0x4a0e 0x1b27 0xc4ee 0xe478 0xad2f 0x1806 0x2f43
-     0xd7a7 0x3dfb 0x0099 0x2b4d 0xdf0b 0x4fc1 0x2480 0x2b83]))
+#?(:kotoba
+   (defn- sqrt-m1 [] :vector-i64
+     (f/of (vector-i64 0xa0b0 0x4a0e 0x1b27 0xc4ee 0xe478 0xad2f 0x1806 0x2f43 0xd7a7 0x3dfb 0x0099 0x2b4d 0xdf0b 0x4fc1 0x2480 0x2b83)))
+   :default
+   (def ^:private sqrt-m1
+     "2^((p-1)/4): a square root of -1, needed when the eighth root in `decode` lands on the wrong branch."
+     (f/of
+      [0xa0b0 0x4a0e 0x1b27 0xc4ee 0xe478 0xad2f 0x1806 0x2f43 0xd7a7 0x3dfb 0x0099 0x2b4d 0xdf0b 0x4fc1 0x2480 0x2b83])))
 
-(def ^:private bx
-  "The base point's x, recovered from y and taken even."
-  (f/of
-   [
-     0xd51a 0x8f25 0x2d60 0xc956 0xa7b2 0x9525 0xc760 0x692c
-     0xdc5c 0xfdd6 0xe231 0xc0a4 0x53fe 0xcd6e 0x36d3 0x2169]))
+#?(:kotoba
+   (defn- bx [] :vector-i64
+     (f/of (vector-i64 0xd51a 0x8f25 0x2d60 0xc956 0xa7b2 0x9525 0xc760 0x692c 0xdc5c 0xfdd6 0xe231 0xc0a4 0x53fe 0xcd6e 0x36d3 0x2169)))
+   :default
+   (def ^:private bx
+     "The base point's x, recovered from y and taken even."
+     (f/of
+      [0xd51a 0x8f25 0x2d60 0xc956 0xa7b2 0x9525 0xc760 0x692c 0xdc5c 0xfdd6 0xe231 0xc0a4 0x53fe 0xcd6e 0x36d3 0x2169])))
 
-(def ^:private by
-  "The base point's y = 4/5."
-  (f/of
-   [
-     0x6658 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666
-     0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666]))
+#?(:kotoba
+   (defn- by [] :vector-i64
+     (f/of (vector-i64 0x6658 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666)))
+   :default
+   (def ^:private by
+     "The base point's y = 4/5."
+     (f/of
+      [0x6658 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666 0x6666])))
+
+
+;; Dual-runtime (the posix-path idiom, amu src/kotoba/compiler/posix_path.cljk):
+;; `#?@(:kotoba [...])` adds the types Kotoba needs and the host keeps the untyped
+;; Clojure it always ran; `#?(:kotoba A :default B)` gives Kotoba its own reading.
+;;
+;; On the host a point is a vector of four field elements. Kotoba has no nested
+;; vectors, so a point there is ONE `:vector-i64` of 64 lanes -- X in 0-15, Y in
+;; 16-31, Z in 32-47, T in 48-63 -- and `decode`, which answers nil for bytes that
+;; do not encode a point, answers an `[:option :vector-i64]`. `identity-point` and
+;; `base` are values (functions) on the host and zero-argument functions on Kotoba.
+
+#?(:kotoba
+   (defn- lane [p :vector-i64 base :i64] :vector-i64
+     (loop [i 0 out (vector-i64)]
+       (if (>= i 16)
+         out
+         (recur (+ i 1) (vector-conj out (vector-at p (+ base i))))))))
+
+#?(:kotoba
+   (defn- append-all [a :vector-i64 b :vector-i64] :vector-i64
+     (let [n (vector-count b)]
+       (loop [i 0 out a]
+         (if (>= i n) out (recur (+ i 1) (vector-conj out (vector-at b i))))))))
 
 (defn point
   "A point as `[X Y Z T]`."
-  [x y z t] [x y z t])
+  [#?@(:kotoba [x :vector-i64 y :vector-i64 z :vector-i64 t :vector-i64] :default [x y z t])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba (append-all (append-all (append-all x y) z) t)
+     :default [x y z t]))
 
-(def identity-point
-  "The neutral element: (0, 1). Not the base point -- adding it changes
+#?(:kotoba
+   (defn identity-point
+     "The neutral element: (0, 1). Not the base point -- adding it changes
   nothing, which is what makes it the ladder's starting value."
-  (fn [] [(f/zero) (f/one) (f/one) (f/zero)]))
+     [] :vector-i64
+     (point (f/zero) (f/one) (f/one) (f/zero)))
+   :default
+   (def identity-point
+     "The neutral element: (0, 1). Not the base point -- adding it changes
+  nothing, which is what makes it the ladder's starting value."
+     (fn [] [(f/zero) (f/one) (f/one) (f/zero)])))
 
-(def base
-  "The generator RFC 8032 §5.1 fixes."
-  (fn [] [(f/copy bx) (f/copy by) (f/one) (f/mul bx by)]))
+#?(:kotoba
+   (defn base
+     "The generator RFC 8032 §5.1 fixes."
+     [] :vector-i64
+     (point (f/copy (bx)) (f/copy (by)) (f/one) (f/mul (bx) (by))))
+   :default
+   (def base
+     "The generator RFC 8032 §5.1 fixes."
+     (fn [] [(f/copy bx) (f/copy by) (f/one) (f/mul bx by)])))
 
 (defn add
   "Extended-coordinate addition, complete for this curve -- no special case
   for doubling, for the identity, or for a point plus its negation. That
   completeness is the reason the ladder below has no branch."
-  [[px py pz pt] [qx qy qz qt]]
-  (let [a (f/mul (f/sub py px) (f/sub qy qx))
-        b (f/mul (f/add px py) (f/add qx qy))
-        c (f/mul (f/mul pt qt) d2)
-        dd (let [z (f/mul pz qz)] (f/add z z))
-        e (f/sub b a)
-        ff (f/sub dd c)
-        g (f/add dd c)
-        h (f/add b a)]
-    [(f/mul e ff) (f/mul h g) (f/mul g ff) (f/mul e h)]))
+  [#?@(:kotoba [p :vector-i64 q :vector-i64] :default [[px py pz pt] [qx qy qz qt]])]
+  #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (let [px (lane p 0) py (lane p 16) pz (lane p 32) pt (lane p 48)
+           qx (lane q 0) qy (lane q 16) qz (lane q 32) qt (lane q 48)
+           a (f/mul (f/sub py px) (f/sub qy qx))
+           b (f/mul (f/add px py) (f/add qx qy))
+           c (f/mul (f/mul pt qt) (d2))
+           dd (let [z (f/mul pz qz)] (f/add z z))
+           e (f/sub b a)
+           ff (f/sub dd c)
+           g (f/add dd c)
+           h (f/add b a)]
+       (point (f/mul e ff) (f/mul h g) (f/mul g ff) (f/mul e h)))
+     :default
+     (let [a (f/mul (f/sub py px) (f/sub qy qx))
+           b (f/mul (f/add px py) (f/add qx qy))
+           c (f/mul (f/mul pt qt) d2)
+           dd (let [z (f/mul pz qz)] (f/add z z))
+           e (f/sub b a)
+           ff (f/sub dd c)
+           g (f/add dd c)
+           h (f/add b a)]
+       [(f/mul e ff) (f/mul h g) (f/mul g ff) (f/mul e h)])))
 
-(defn- cswap! [p q b]
-  (dotimes [i 4] (f/swap!* (nth p i) (nth q i) b)))
+#?(:kotoba
+   ;; The four-lane-group conditional swap of the host's `cswap!`: `p` after the
+   ;; exchange, and `q` after it. A function returns one value, so it is two.
+   (defn- cswap-p [p :vector-i64 q :vector-i64 b :i64] :vector-i64
+     (point (f/swap-p (lane p 0) (lane q 0) b) (f/swap-p (lane p 16) (lane q 16) b)
+            (f/swap-p (lane p 32) (lane q 32) b) (f/swap-p (lane p 48) (lane q 48) b))))
+
+#?(:kotoba
+   (defn- cswap-q [p :vector-i64 q :vector-i64 b :i64] :vector-i64
+     (point (f/swap-q (lane p 0) (lane q 0) b) (f/swap-q (lane p 16) (lane q 16) b)
+            (f/swap-q (lane p 32) (lane q 32) b) (f/swap-q (lane p 48) (lane q 48) b))))
+
+#?(:clj
+   (defn- cswap! [p q b]
+     (dotimes [i 4] (f/swap!* (nth p i) (nth q i) b)))
+   :cljs
+   (defn- cswap! [p q b]
+     (dotimes [i 4] (f/swap!* (nth p i) (nth q i) b))))
 
 (defn scalar-mult
   "`[s]q` for a 32-byte little-endian scalar.
@@ -97,49 +177,81 @@
   of operations does not depend on the scalar -- the shape a constant-time
   implementation needs, with the caveat in this namespace's docstring about
   what portable Clojure can promise."
-  [q s]
-  (loop [i 255
-         p [(f/zero) (f/one) (f/one) (f/zero)]
-         q (mapv f/copy q)]
-    (if (neg? i)
-      p
-      (let [b (bit-and (unsigned-bit-shift-right (nth s (quot i 8)) (bit-and i 7)) 1)]
-        (cswap! p q b)
-        (let [q' (add q p)
-              p' (add p p)]
-          (cswap! p' q' b)
-          (recur (dec i) p' q'))))))
+  [#?@(:kotoba [q :vector-i64 s :vector-i64] :default [q s])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (loop [i 255
+            p (identity-point)
+            q q]
+       (if (< i 0)
+         p
+         (let [b (bit-and (u64-shift-right (vector-at s (quot i 8)) (- i (* 8 (quot i 8)))) 1)
+               pw (cswap-p p q b)
+               qw (cswap-q p q b)
+               q1 (add qw pw)
+               p1 (add pw pw)]
+           (recur (- i 1) (cswap-p p1 q1 b) (cswap-q p1 q1 b)))))
+     :default
+     (loop [i 255
+            p [(f/zero) (f/one) (f/one) (f/zero)]
+            q (mapv f/copy q)]
+       (if (neg? i)
+         p
+         (let [b (bit-and (unsigned-bit-shift-right (nth s (quot i 8)) (bit-and i 7)) 1)]
+           (cswap! p q b)
+           (let [q' (add q p)
+                 p' (add p p)]
+             (cswap! p' q' b)
+             (recur (dec i) p' q')))))))
 
-(defn scalar-mult-base [s] (scalar-mult (base) s))
+(defn scalar-mult-base [#?@(:kotoba [s :vector-i64] :default [s])] #?@(:kotoba [:vector-i64])
+  (scalar-mult (base) s))
 
 ;; ── encoding ─────────────────────────────────────────────────────────────────
 
 (defn- parity
   "The low bit of the canonical encoding -- RFC 8032's `x_0`."
-  [e]
-  (bit-and (nth (f/pack e) 0) 1))
+  [#?@(:kotoba [e :vector-i64] :default [e])] #?@(:kotoba [:i64])
+  (bit-and #?(:kotoba (vector-at (f/pack e) 0) :default (nth (f/pack e) 0)) 1))
 
 (defn- pow-2523
   "`x^((p-5)/8)`, the exponent the square root in §5.1.3 needs.
 
   Written as the ladder rather than as a general `pow` because the exponent
   is fixed and public: 250 squarings with a multiply at all but bits 1 and 2."
-  [x]
+  [#?@(:kotoba [x :vector-i64] :default [x])] #?@(:kotoba [:vector-i64])
   (loop [c (f/copy x) i 250]
-    (if (neg? i)
+    (if (< i 0)
       c
       (recur (let [c (f/sq c)] (if (= i 1) c (f/mul c x))) (dec i)))))
 
 (defn encode
   "A point to 32 bytes: `y` with the parity of `x` in the top bit."
-  [[px py pz _]]
-  (let [zi (f/invert pz)
-        tx (f/mul px zi)
-        ty (f/mul py zi)
-        r (vec (f/pack ty))]
-    (assoc r 31 (bit-or (nth r 31) (bit-shift-left (parity tx) 7)))))
+  [#?@(:kotoba [p :vector-i64] :default [[px py pz _]])] #?@(:kotoba [:vector-i64])
+  #?(:kotoba
+     (let [zi (f/invert (lane p 32))
+           tx (f/mul (lane p 0) zi)
+           ty (f/mul (lane p 16) zi)
+           r (f/pack ty)]
+       (vector-assoc r 31 (bit-or (vector-at r 31) (i64-shift-left (parity tx) 7))))
+     :default
+     (let [zi (f/invert pz)
+           tx (f/mul px zi)
+           ty (f/mul py zi)
+           r (vec (f/pack ty))]
+       (assoc r 31 (bit-or (nth r 31) (bit-shift-left (parity tx) 7))))))
 
-(defn- eq? [a b] (= (f/pack a) (f/pack b)))
+#?(:kotoba
+   (defn- same-bytes? [a :vector-i64 b :vector-i64] :bool
+     (if (= (vector-count a) (vector-count b))
+       (loop [i 0]
+         (if (>= i (vector-count a))
+           true
+           (if (= (vector-at a i) (vector-at b i)) (recur (+ i 1)) false)))
+       false)))
+
+(defn- eq? [#?@(:kotoba [a :vector-i64 b :vector-i64] :default [a b])] #?@(:kotoba [:bool])
+  #?(:kotoba (same-bytes? (f/pack a) (f/pack b))
+     :default (= (f/pack a) (f/pack b))))
 
 (defn decode
   "32 bytes to a point, or nil when they do not encode one.
@@ -147,31 +259,56 @@
   Returning nil rather than a garbage point matters: a verifier handed a
   malformed public key must reject the signature, not compare against
   whatever the arithmetic produced."
-  [bs]
-  (let [y (f/unpack bs)
-        z (f/one)
-        num (f/sub (f/sq y) z)                 ; y^2 - 1
-        den (f/add (f/mul (f/sq y) d) z)       ; d*y^2 + 1
-        den2 (f/sq den)
-        den4 (f/sq den2)
-        den6 (f/mul den4 den2)
-        t (f/mul (f/mul den6 num) den)
-        t (pow-2523 t)
-        t (f/mul (f/mul (f/mul (f/mul t num) den) den) den)
-        chk (f/mul (f/sq t) den)
-        ;; The eighth root can land on either of two square roots; if the
-        ;; first does not check, sqrt(-1) times it is the other.
-        t (if (eq? chk num) t (f/mul t sqrt-m1))
-        chk (f/mul (f/sq t) den)]
-    (when (eq? chk num)
-      (let [x (if (= (parity t) (unsigned-bit-shift-right (nth bs 31) 7))
-                t
-                (f/sub (f/zero) t))]
-        [x y (f/one) (f/mul x y)]))))
+  [#?@(:kotoba [bs :vector-i64] :default [bs])]
+  #?@(:kotoba [[:option :vector-i64]])
+  #?(:kotoba
+     (let [y (f/unpack bs)
+           z (f/one)
+           num (f/sub (f/sq y) z)
+           den (f/add (f/mul (f/sq y) (d)) z)
+           den2 (f/sq den)
+           den4 (f/sq den2)
+           den6 (f/mul den4 den2)
+           t0 (f/mul (f/mul den6 num) den)
+           t1 (pow-2523 t0)
+           t2 (f/mul (f/mul (f/mul (f/mul t1 num) den) den) den)
+           chk0 (f/mul (f/sq t2) den)
+           ;; The eighth root can land on either of two square roots; if the
+           ;; first does not check, sqrt(-1) times it is the other.
+           t (if (eq? chk0 num) t2 (f/mul t2 (sqrt-m1)))
+           chk (f/mul (f/sq t) den)]
+       (if (eq? chk num)
+         (let [x (if (= (parity t) (u64-shift-right (vector-at bs 31) 7))
+                   t
+                   (f/sub (f/zero) t))]
+           (option-some-of [:option :vector-i64] (point x y (f/one) (f/mul x y))))
+         (option-none-of [:option :vector-i64])))
+     :default
+     (let [y (f/unpack bs)
+           z (f/one)
+           num (f/sub (f/sq y) z)                 ; y^2 - 1
+           den (f/add (f/mul (f/sq y) d) z)       ; d*y^2 + 1
+           den2 (f/sq den)
+           den4 (f/sq den2)
+           den6 (f/mul den4 den2)
+           t (f/mul (f/mul den6 num) den)
+           t (pow-2523 t)
+           t (f/mul (f/mul (f/mul (f/mul t num) den) den) den)
+           chk (f/mul (f/sq t) den)
+           ;; The eighth root can land on either of two square roots; if the
+           ;; first does not check, sqrt(-1) times it is the other.
+           t (if (eq? chk num) t (f/mul t sqrt-m1))
+           chk (f/mul (f/sq t) den)]
+       (when (eq? chk num)
+         (let [x (if (= (parity t) (unsigned-bit-shift-right (nth bs 31) 7))
+                   t
+                   (f/sub (f/zero) t))]
+           [x y (f/one) (f/mul x y)])))))
 
 (defn equal?
   "Whether two points are the same, compared in affine form. Extended
   coordinates are projective, so `=` on the four field elements would report
   two encodings of one point as different."
-  [p q]
-  (= (encode p) (encode q)))
+  [#?@(:kotoba [p :vector-i64 q :vector-i64] :default [p q])] #?@(:kotoba [:bool])
+  #?(:kotoba (same-bytes? (encode p) (encode q))
+     :default (= (encode p) (encode q))))
